@@ -1,0 +1,150 @@
+const express = require("express");
+const router = express.Router();
+const { planSlides } = require("../services/claude");
+const { generateTemplate } = require("../services/generator");
+const { requireAuth } = require("../middleware/auth");
+
+// In-memory job store (use Redis in production for multi-instance)
+const jobs = new Map();
+
+// ─── POST /api/plan — Generate slide plan from copy ──────────
+router.post("/plan", requireAuth, async (req, res) => {
+  const { copy } = req.body;
+  if (!copy?.trim()) {
+    return res.status(400).json({ error: "Copy is required" });
+  }
+
+  try {
+    const plan = await planSlides(copy.trim());
+    res.json({ success: true, plan });
+  } catch (err) {
+    console.error("Plan error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/generate — Create Canva template from plan ────
+router.post("/generate", requireAuth, async (req, res) => {
+  const { plan } = req.body;
+  if (!plan?.slides?.length) {
+    return res.status(400).json({ error: "Valid plan is required" });
+  }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const accessToken = req.session.accessToken;
+
+  // Initialize job
+  jobs.set(jobId, {
+    status: "running",
+    step: "starting",
+    message: "Iniciando...",
+    progress: 0,
+    result: null,
+    error: null,
+    createdAt: Date.now(),
+  });
+
+  // Run async (don't await)
+  generateTemplate(accessToken, plan, (update) => {
+    jobs.set(jobId, { ...jobs.get(jobId), ...update });
+  })
+    .then((result) => {
+      jobs.set(jobId, {
+        ...jobs.get(jobId),
+        status: "done",
+        step: "done",
+        progress: 100,
+        message: "Template criado!",
+        result,
+      });
+    })
+    .catch((err) => {
+      console.error("Generate error:", err.message);
+      jobs.set(jobId, {
+        ...jobs.get(jobId),
+        status: "error",
+        error: err.message,
+      });
+    });
+
+  res.json({ success: true, jobId });
+});
+
+// ─── GET /api/status/:jobId — Poll job status ────────────────
+router.get("/status/:jobId", requireAuth, (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  // Clean up old jobs (>1 hour)
+  for (const [id, j] of jobs) {
+    if (Date.now() - j.createdAt > 3600000) jobs.delete(id);
+  }
+
+  res.json(job);
+});
+
+// ─── POST /api/generate-full — Plan + Generate in one call ───
+router.post("/generate-full", requireAuth, async (req, res) => {
+  const { copy } = req.body;
+  if (!copy?.trim()) {
+    return res.status(400).json({ error: "Copy is required" });
+  }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const accessToken = req.session.accessToken;
+
+  jobs.set(jobId, {
+    status: "running",
+    step: "planning",
+    message: "Planejando slides com IA...",
+    progress: 0,
+    result: null,
+    error: null,
+    plan: null,
+    createdAt: Date.now(),
+  });
+
+  // Run async
+  (async () => {
+    try {
+      // Step 1: Plan
+      const plan = await planSlides(copy.trim());
+      jobs.set(jobId, {
+        ...jobs.get(jobId),
+        plan,
+        step: "creating",
+        message: "Criando páginas no Canva...",
+        progress: 20,
+      });
+
+      // Step 2: Generate
+      const result = await generateTemplate(accessToken, plan, (update) => {
+        const current = jobs.get(jobId);
+        jobs.set(jobId, {
+          ...current,
+          ...update,
+          progress: 20 + Math.round(update.progress * 0.8),
+        });
+      });
+
+      jobs.set(jobId, {
+        ...jobs.get(jobId),
+        status: "done",
+        step: "done",
+        progress: 100,
+        message: "Template criado!",
+        result,
+      });
+    } catch (err) {
+      jobs.set(jobId, {
+        ...jobs.get(jobId),
+        status: "error",
+        error: err.message,
+      });
+    }
+  })();
+
+  res.json({ success: true, jobId });
+});
+
+module.exports = router;
